@@ -3,7 +3,7 @@ import time
 import machine
 
 class KY040:
-    def __init__(self, clk_pin=14, dt_pin=15, sw_pin=4, val_min=1, val_max=10, pull=machine.Pin.PULL_UP):
+    def __init__(self, clk_pin=14, dt_pin=15, sw_pin=16, val_min=1, val_max=10, pull=machine.Pin.PULL_UP):
         # pinos do Raspberry Pi Pico (GPIO numbers)
         self.clk_pin = clk_pin
         self.dt_pin = dt_pin

@@ -98,42 +98,57 @@ class InOut:
             pass
 
 class IO_MODBUS:
-    def __init__(self, dado=None):
+    def __init__(self, dado=None, uart_id=0, baudrate=9600, tx_pin=0, rx_pin=1, timeout=1.0):
         self.dado = dado
-        self.fake_modbus = True
+        self.timeout = timeout
+        self.uart = None
+        self.io_rpi = None
+        # tenta abrir UART0 (TX=GPIO0, RX=GPIO1 por padrão)
         try:
-            # UART0: TX=GPIO0, RX=GPIO1
-            self.uart = machine.UART(0, baudrate=9600, bits=8, parity=None, stop=1)
-            # não é necessário especificar tx/rx se usando UART0 padrão; se preciso:
-            # tx_pin = machine.Pin(0)
-            # rx_pin = machine.Pin(1)
-            # self.uart = machine.UART(0, baudrate=9600, tx=tx_pin, rx=rx_pin)
-        except Exception as e:
-            print("Erro ao abrir UART0:", e)
-            self.uart = None
-            return
+            # máquina MicroPython no Pico aceita parâmetros tx=machine.Pin(...), rx=machine.Pin(...)
+            tx = machine.Pin(tx_pin)
+            rx = machine.Pin(rx_pin)
+            self.uart = machine.UART(uart_id, baudrate=baudrate, bits=8, parity=None, stop=1, tx=tx, rx=rx)
+        except Exception:
+            try:
+                # fallback: sem especificar tx/rx (algumas portas não aceitam objetos Pin)
+                self.uart = machine.UART(uart_id, baudrate=baudrate, bits=8, parity=None, stop=1)
+            except Exception as e:
+                print("Erro ao abrir UART0:", e)
+                self.uart = None
 
-        self.io_rpi = InOut()
+        # instancia InOut somente se UART ok (permite testes sem HW)
+        try:
+            self.io_rpi = InOut()
+        except Exception:
+            self.io_rpi = None
 
     def crc16_modbus(self, data):
         crc = 0xFFFF
-        for byte in data:
-            crc ^= byte
+        for b in data:
+            crc ^= b
             for _ in range(8):
-                if (crc & 0x0001):
+                if crc & 0x0001:
                     crc >>= 1
                     crc ^= 0xA001
                 else:
                     crc >>= 1
-        return crc
+        return crc & 0xFFFF
 
-    def _write_and_read(self, tx_bytes, expected_len, timeout=1.0):
-        if not self.uart:
+    def _write_and_read(self, tx_bytes, expected_len, timeout=None):
+        if self.uart is None:
             return b''
+        timeout = timeout if timeout is not None else self.timeout
         try:
+            # limpa buffer de leitura antes de enviar
+            try:
+                while self.uart.any():
+                    self.uart.read()
+            except Exception:
+                pass
             self.uart.write(bytes(tx_bytes))
             start = time.time()
-            while time.time() - start < timeout:
+            while (time.time() - start) < timeout:
                 if self.uart.any() >= expected_len:
                     data = self.uart.read(expected_len)
                     return data if data else b''
@@ -143,128 +158,111 @@ class IO_MODBUS:
         return b''
 
     def _get_adr_PTA(self):
+        # tenta descobrir endereço do dispositivo via broadcast (3, 0x0002, 1)
         broadcast = 0xFF
-        id_loc = hex(broadcast)[2:].zfill(2).upper()
-        hex_text = f"{id_loc}0300020001"
-        bytes_hex = bytes.fromhex(hex_text)
-        crc_result = self.crc16_modbus(bytes_hex)
-        parte_superior = (crc_result >> 8) & 0xFF
-        parte_inferior = crc_result & 0xFF
+        tx_payload = bytes([broadcast, 3, 0, 2, 0, 1])
+        crc = self.crc16_modbus(tx_payload)
+        crc_lo = crc & 0xFF
+        crc_hi = (crc >> 8) & 0xFF
+        tx = [broadcast, 3, 0, 2, 0, 1, crc_lo, crc_hi]
 
-        for i in range(3):
+        for attempt in range(3):
+            resp = self._write_and_read(tx, expected_len=7, timeout=1.0)
+            if not resp:
+                continue
             try:
-                tx = [broadcast, 3, 0, 2, 0, 1, parte_inferior, parte_superior]
-                resp = self._write_and_read(tx, expected_len=7, timeout=1.0)
-                if resp:
-                    hex_recv = resp.hex()
-                    # valida CRC
-                    # reconstrói bytes para calculo CRC (menor parte)
-                    bytes_for_crc = bytes.fromhex(hex_recv[0:10])
-                    crc_calc = self.crc16_modbus(bytes_for_crc)
-                    sup = (crc_calc >> 8) & 0xFF
-                    inf = crc_calc & 0xFF
-                    superior_crc = int(hex_recv[12:14], 16)
-                    inferior_crc = int(hex_recv[10:12], 16)
-                    if sup == superior_crc and inf == inferior_crc:
-                        dados_recebidos = hex_recv[6:10]
-                        return int(dados_recebidos, 16)
-                    else:
-                        if i > 1:
-                            self.reset_serial()
+                # valida CRC do pacote recebido
+                if len(resp) < 7:
+                    continue
+                resp_bytes = bytes(resp)
+                resp_crc_calc = self.crc16_modbus(resp_bytes[0:5])
+                resp_crc_lo = resp_bytes[5]
+                resp_crc_hi = resp_bytes[6]
+                if (resp_crc_calc & 0xFF) == resp_crc_lo and ((resp_crc_calc >> 8) & 0xFF) == resp_crc_hi:
+                    # dados retornados nos bytes 3..4 (index 3..4 zero-based?)
+                    # conforme uso anterior, pega bytes 3..4 (pos 3..4 -> hex_recv[6:10])
+                    try:
+                        data_high = resp_bytes[3]
+                        data_low = resp_bytes[4]
+                        value = (data_high << 8) | data_low
+                        return value
+                    except Exception:
+                        return -1
                 else:
-                    if i > 1:
-                        self.reset_serial()
-            except Exception as e:
-                print("Erro de comunicação:", e)
-                return -1
+                    self.reset_serial()
+            except Exception:
+                self.reset_serial()
         return -1
 
     def config_adr_PTA(self, adr):
-        adr_target = hex(adr)[2:].zfill(4).upper()
+        # escreve novo endereço adr (16-bit) usando função 6 no dispositivo encontrado
         adr_device = self._get_adr_PTA()
         if adr_device == -1:
             return False
-        id_device = hex(adr_device)[2:].zfill(2).upper()
-        hex_text = f"{id_device}060002{adr_target}"
-        bytes_hex = bytes.fromhex(hex_text)
-        crc_result = self.crc16_modbus(bytes_hex)
-        parte_superior = (crc_result >> 8) & 0xFF
-        parte_inferior = crc_result & 0xFF
-
-        adr_target_int = int(adr_target, 16)
-        msb = (adr_target_int >> 8) & 0xFF
-        lsb = adr_target_int & 0xFF
-
-        for i in range(3):
-            try:
-                tx = [adr_device, 6, 0, 2, msb, lsb, parte_inferior, parte_superior]
-                resp = self._write_and_read(tx, expected_len=8, timeout=1.0)
-                if resp:
-                    hex_recv = resp.hex()
-                    bytes_for_crc = bytes.fromhex(hex_recv[0:12])
-                    crc_calc = self.crc16_modbus(bytes_for_crc)
-                    sup = (crc_calc >> 8) & 0xFF
-                    inf = crc_calc & 0xFF
-                    superior_crc = int(hex_recv[14:16], 16)
-                    inferior_crc = int(hex_recv[12:14], 16)
-                    if sup == superior_crc and inf == inferior_crc:
-                        id_target = int(hex_recv[0:2], 16)
-                        id_change = int(hex_recv[8:12], 16)
-                        return id_target, id_change
-                    else:
-                        if i > 1:
-                            self.reset_serial()
-                else:
-                    if i > 1:
-                        self.reset_serial()
-            except Exception as e:
-                print("Erro de comunicação:", e)
+        try:
+            id_device = adr_device & 0xFF
+            msb = (adr >> 8) & 0xFF
+            lsb = adr & 0xFF
+            tx_payload = bytes([id_device, 6, 0, 2, msb, lsb])
+            crc = self.crc16_modbus(tx_payload)
+            tx = [id_device, 6, 0, 2, msb, lsb, crc & 0xFF, (crc >> 8) & 0xFF]
+            resp = self._write_and_read(tx, expected_len=8, timeout=1.0)
+            if not resp:
                 return -1
+            if len(resp) < 8:
+                return -1
+            resp_bytes = bytes(resp)
+            crc_calc = self.crc16_modbus(resp_bytes[0:6])
+            if (crc_calc & 0xFF) == resp_bytes[6] and ((crc_calc >> 8) & 0xFF) == resp_bytes[7]:
+                # retorna (id_target, id_change) semelhante à implementação original
+                id_target = resp_bytes[0]
+                # bytes 4..5 representam o valor escrito (msb, lsb)
+                id_change = (resp_bytes[4] << 8) | resp_bytes[5]
+                return id_target, id_change
+        except Exception:
+            pass
         return -1
 
     def get_temperature_channel(self, adr):
-        hex_id = hex(adr)[2:].zfill(2).upper()
-        hex_text = f"{hex_id}0300000001"
-        bytes_hex = bytes.fromhex(hex_text)
-        crc_result = self.crc16_modbus(bytes_hex)
-        parte_superior = (crc_result >> 8) & 0xFF
-        parte_inferior = crc_result & 0xFF
-
-        for i in range(3):
-            try:
-                tx = [adr, 3, 0, 0, 0, 1, parte_inferior, parte_superior]
-                resp = self._write_and_read(tx, expected_len=7, timeout=1.0)
-                if resp:
-                    hex_recv = resp.hex()
-                    bytes_for_crc = bytes.fromhex(hex_recv[0:10])
-                    crc_calc = self.crc16_modbus(bytes_for_crc)
-                    sup = (crc_calc >> 8) & 0xFF
-                    inf = crc_calc & 0xFF
-                    superior_crc = int(hex_recv[12:14], 16)
-                    inferior_crc = int(hex_recv[10:12], 16)
-                    if sup == superior_crc and inf == inferior_crc:
-                        value = int(hex_recv[6:10], 16) / 10.0
-                        return value
-                    else:
-                        if i > 1:
-                            self.reset_serial()
-                else:
-                    if i > 1:
-                        self.reset_serial()
-            except Exception as e:
-                print("Erro de comunicação:", e)
+        # lê registrador 0x0000 (função 3, qty 1) e interpreta resultado /10.0
+        try:
+            payload = bytes([adr & 0xFF, 3, 0, 0, 0, 1])
+            crc = self.crc16_modbus(payload)
+            tx = [adr & 0xFF, 3, 0, 0, 0, 1, crc & 0xFF, (crc >> 8) & 0xFF]
+            resp = self._write_and_read(tx, expected_len=7, timeout=1.0)
+            if not resp or len(resp) < 7:
                 return -1
-        return -1
+            resp_bytes = bytes(resp)
+            # valida CRC
+            crc_calc = self.crc16_modbus(resp_bytes[0:5])
+            if (crc_calc & 0xFF) != resp_bytes[5] or ((crc_calc >> 8) & 0xFF) != resp_bytes[6]:
+                self.reset_serial()
+                return -1
+            # bytes 3..4 contêm valor
+            value = (resp_bytes[3] << 8) | resp_bytes[4]
+            return value / 10.0
+        except Exception:
+            return -1
 
     def reset_serial(self):
+        # tenta reinicializar UART para recuperar comunicação
         try:
             if self.uart:
-                self.uart.deinit()
-                time.sleep(0.5)
-                self.uart = machine.UART(0, baudrate=9600, bits=8, parity=None, stop=1)
-                print("UART0 resetada com sucesso.")
+                try:
+                    self.uart.deinit()
+                except Exception:
+                    pass
+                time.sleep(0.3)
+                # recria uart com parâmetros iniciais (assume UART0)
+                try:
+                    self.uart = machine.UART(0, baudrate=9600, bits=8, parity=None, stop=1, tx=machine.Pin(0), rx=machine.Pin(1))
+                except Exception:
+                    try:
+                        self.uart = machine.UART(0, baudrate=9600, bits=8, parity=None, stop=1)
+                    except Exception as e:
+                        print("Erro ao resetar UART0:", e)
         except Exception as e:
-            print("Erro ao resetar UART0:", e)
+            print("Erro ao resetar serial:", e)
 
 if __name__ == '__main__':
     # testes simples podem ser feitos interativamente no REPL do Pico
