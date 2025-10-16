@@ -1,166 +1,118 @@
-import serial
+# ...existing code...
 import time
-import random
-import threading
-
-class FakeRPiGPIO:
-    BCM = "BCM"
-    PUD_UP = "PUD_UP"
-    IN = "IN"
-    OUT = "OUT"
-    HIGH = 1
-    LOW = 0
-
-    def __init__(self):
-        self.pins = {}
-
-    def setmode(self, mode):
-        self.mode = mode
-
-    def setwarnings(self, state):
-        self.warnings = state
-
-    def setup(self, pin, direction, pull_up_down=None):
-        self.pins[pin] = {'direction': direction, 'state': self.HIGH if pull_up_down == self.PUD_UP else self.LOW}
-
-    def input(self, pin):
-        if pin in self.pins:
-            return self.pins[pin]['state']
-        raise ValueError(f"Pin {pin} not set up.")
-
-    def output(self, pin, state):
-        if pin in self.pins and self.pins[pin]['direction'] == self.OUT:
-            self.pins[pin]['state'] = state
-        else:
-            raise ValueError(f"Pin {pin} not set up or not set as output.")
-
-    def cleanup(self):
-        self.pins.clear()
-
+import machine
 
 class InOut:
     def __init__(self):
-        self.SAIDA_PWM_1 = 20
-        self.SAIDA_PWM_2 = 26
-        self.SAIDA_PWM_3 = 16
-        self.SAIDA_PWM_4 = 19
-        self.SAIDA_PWM_5 = 5
-        self.SAIDA_PWM_6 = 6
-        self.SAIDA_MAQUINA_PRONTA = 13
+        # pinos conforme solicitado (GPIO do Raspberry Pi Pico)
+        self.SAIDA_PWM_1 = 12
+        self.SAIDA_PWM_2 = 11
+        self.SAIDA_PWM_3 = 10
+        self.SAIDA_PWM_4 = 7
+        self.SAIDA_PWM_5 = 3
+        self.SAIDA_PWM_6 = 4
+        self.SAIDA_MAQUINA_PRONTA = 6
 
-        self.ENTRADA_ACIONA_MAQUINA = 12
-        self.pwm_thread_running = True
+        self.ENTRADA_ACIONA_MAQUINA = 5
 
-        try:
-            import RPi.GPIO as GPIO
-            self.GPIO = GPIO
-        except ImportError:
-            print("RPi.GPIO not found. Using fake GPIO.")
-            self.GPIO = FakeRPiGPIO()
-
-        self.GPIO.setmode(self.GPIO.BCM)
-        self.GPIO.setwarnings(False)
-
-        self.GPIO.setup(self.SAIDA_PWM_1,  self.GPIO.OUT)
-        self.GPIO.setup(self.SAIDA_PWM_2,  self.GPIO.OUT)
-        self.GPIO.setup(self.SAIDA_PWM_3,  self.GPIO.OUT)
-        self.GPIO.setup(self.SAIDA_PWM_4,  self.GPIO.OUT)
-        self.GPIO.setup(self.SAIDA_PWM_5,  self.GPIO.OUT)
-        self.GPIO.setup(self.SAIDA_PWM_6,  self.GPIO.OUT)
-
-        self.GPIO.setup(self.SAIDA_MAQUINA_PRONTA, self.GPIO.OUT)
-        self.GPIO.output(self.SAIDA_MAQUINA_PRONTA, self.GPIO.HIGH)  # Inicializa como desligado
-
-        self.GPIO.setup(self.ENTRADA_ACIONA_MAQUINA, self.GPIO.IN, pull_up_down=self.GPIO.PUD_UP)
-
-        self.pwm_period = 1.0  # Default period in seconds
-        self.pwm_duty_cycles = {
-            self.SAIDA_PWM_1: 0,
-            self.SAIDA_PWM_2: 0,
-            self.SAIDA_PWM_3: 0,
-            self.SAIDA_PWM_4: 0,
-            self.SAIDA_PWM_5: 0,
-            self.SAIDA_PWM_6: 0
+        # PWM / IO inicialização
+        self.pwm_period = 1.0  # periodo em segundos (por compatibilidade com código anterior)
+        self._pwm_freq = max(1, int(1.0 / self.pwm_period))  # freq em Hz
+        self.pwm_pins = {
+            self.SAIDA_PWM_1: None,
+            self.SAIDA_PWM_2: None,
+            self.SAIDA_PWM_3: None,
+            self.SAIDA_PWM_4: None,
+            self.SAIDA_PWM_5: None,
+            self.SAIDA_PWM_6: None,
         }
+        self.pwm_duty_cycles = {pin: 0 for pin in self.pwm_pins}
 
-        self.pwm_threads = {}
-        for pin in self.pwm_duty_cycles:
-            thread = threading.Thread(target=self._pwm_control, args=(pin,))
-            thread.daemon = True
-            thread.start()
-            self.pwm_threads[pin] = thread
+        # configurar pinos como PWM/Pin
+        for pin in self.pwm_pins:
+            p = machine.Pin(pin, machine.Pin.OUT)
+            pwm = machine.PWM(p)
+            pwm.freq(self._pwm_freq)
+            pwm.duty_u16(0)
+            self.pwm_pins[pin] = pwm
+
+        # saída "máquina pronta" (usado como saída ativa baixa no código original)
+        self.saida_pronta = machine.Pin(self.SAIDA_MAQUINA_PRONTA, machine.Pin.OUT)
+        self.saida_pronta.value(1)  # iniciliza como "desligado" (HIGH)
+
+        # entrada que aciona a máquina (pull-up)
+        self.entrada_aciona = machine.Pin(self.ENTRADA_ACIONA_MAQUINA, machine.Pin.IN, machine.Pin.PULL_UP)
 
     @property
     def get_aciona_maquina(self):
-        if self.GPIO.input(self.ENTRADA_ACIONA_MAQUINA) == self.GPIO.LOW:
-            return 1
-        else:
-            return 0
-
-    def _pwm_control(self, pin):
-        while self.pwm_thread_running:
-            duty_cycle = self.pwm_duty_cycles[pin]
-            on_time = self.pwm_period * (duty_cycle / 100.0)
-            off_time = self.pwm_period - on_time
-            if on_time > 0:
-                self.GPIO.output(pin, self.GPIO.LOW)
-                time.sleep(on_time)
-            if off_time > 0:
-                self.GPIO.output(pin, self.GPIO.HIGH)
-                time.sleep(off_time)
+        # retorna 1 quando acionado (entrada em LOW com pull-up)
+        return 1 if self.entrada_aciona.value() == 0 else 0
 
     def set_pwm_period(self, period):
+        # atualiza periodo (segundos) e recalcula frequência para PWMs
+        if period <= 0:
+            return
         self.pwm_period = period
+        freq = max(1, int(1.0 / period))
+        self._pwm_freq = freq
+        for pwm in self.pwm_pins.values():
+            try:
+                pwm.freq(self._pwm_freq)
+            except Exception:
+                pass
 
     def set_pwm_duty_cycle(self, pin, duty_cycle):
-        if pin in self.pwm_duty_cycles:
-            self.pwm_duty_cycles[pin] = duty_cycle
+        # duty_cycle em 0..100
+        if pin in self.pwm_pins:
+            duty = max(0, min(100, int(duty_cycle)))
+            self.pwm_duty_cycles[pin] = duty
+            # duty_u16 aceita 0..65535
+            self.pwm_pins[pin].duty_u16(int(duty * 65535 / 100))
 
     def aciona_pwm(self, duty_cycle, saida):
-        if saida == 1:
-            self.set_pwm_duty_cycle(self.SAIDA_PWM_1, duty_cycle)
-        elif saida == 2:
-            self.set_pwm_duty_cycle(self.SAIDA_PWM_2, duty_cycle)
-        elif saida == 3:
-            self.set_pwm_duty_cycle(self.SAIDA_PWM_3, duty_cycle)
-        elif saida == 4:
-            self.set_pwm_duty_cycle(self.SAIDA_PWM_4, duty_cycle)
-        elif saida == 5:
-            self.set_pwm_duty_cycle(self.SAIDA_PWM_5, duty_cycle)
-        elif saida == 6:
-            self.set_pwm_duty_cycle(self.SAIDA_PWM_6, duty_cycle) 
-
-    def cleanup(self):
-        self.pwm_thread_running = False
-        for pin, thread in self.pwm_threads.items():
-            thread.join()
-        self.GPIO.cleanup()
+        mapping = {
+            1: self.SAIDA_PWM_1,
+            2: self.SAIDA_PWM_2,
+            3: self.SAIDA_PWM_3,
+            4: self.SAIDA_PWM_4,
+            5: self.SAIDA_PWM_5,
+            6: self.SAIDA_PWM_6,
+        }
+        if saida in mapping:
+            self.set_pwm_duty_cycle(mapping[saida], duty_cycle)
 
     def aciona_maquina_pronta(self, status):
-        if status:
-            self.GPIO.output(self.SAIDA_MAQUINA_PRONTA, self.GPIO.LOW)
-        else:
-            self.GPIO.output(self.SAIDA_MAQUINA_PRONTA, self.GPIO.HIGH)
+        # mantém compatibilidade: status True -> ativa (LOW), False -> desativa (HIGH)
+        self.saida_pronta.value(0 if status else 1)
+
+    def cleanup(self):
+        # desliga PWMs e reverte pinos
+        for pwm in self.pwm_pins.values():
+            try:
+                pwm.deinit()
+            except Exception:
+                pass
+        try:
+            self.saida_pronta.value(1)
+        except Exception:
+            pass
 
 class IO_MODBUS:
     def __init__(self, dado=None):
         self.dado = dado
         self.fake_modbus = True
         try:
-            self.ser = serial.Serial(
-                                        port='/dev/ttyUSB0',  # Porta serial padrão no Raspberry Pi 4
-                                        # port='/dev/tty.URT0',  # Porta serial padrão no Raspberry Pi 4
-                                        baudrate=9600,       # Taxa de baud
-                                        bytesize=8,
-                                        parity="N",
-                                        stopbits=1,
-                                        timeout=1,            # Timeout de leitura
-                                        #xonxoff=False,         # Controle de fluxo por software (XON/XOFF)
-                                        #rtscts=True
-                                    )
+            # UART0: TX=GPIO0, RX=GPIO1
+            self.uart = machine.UART(0, baudrate=9600, bits=8, parity=None, stop=1)
+            # não é necessário especificar tx/rx se usando UART0 padrão; se preciso:
+            # tx_pin = machine.Pin(0)
+            # rx_pin = machine.Pin(1)
+            # self.uart = machine.UART(0, baudrate=9600, tx=tx_pin, rx=rx_pin)
         except Exception as e:
-            print(f"Erro ao conectar com a serial: {e}")
+            print("Erro ao abrir UART0:", e)
+            self.uart = None
             return
+
         self.io_rpi = InOut()
 
     def crc16_modbus(self, data):
@@ -175,51 +127,47 @@ class IO_MODBUS:
                     crc >>= 1
         return crc
 
+    def _write_and_read(self, tx_bytes, expected_len, timeout=1.0):
+        if not self.uart:
+            return b''
+        try:
+            self.uart.write(bytes(tx_bytes))
+            start = time.time()
+            while time.time() - start < timeout:
+                if self.uart.any() >= expected_len:
+                    data = self.uart.read(expected_len)
+                    return data if data else b''
+                time.sleep(0.01)
+        except Exception:
+            pass
+        return b''
+
     def _get_adr_PTA(self):
         broadcast = 0xFF
-
-        id_loc = hex(broadcast)[2:]
-        id_loc = id_loc.zfill(2).upper()
-
+        id_loc = hex(broadcast)[2:].zfill(2).upper()
         hex_text = f"{id_loc}0300020001"
-        bytes_hex = bytes.fromhex(hex_text)  # Transforma em hexa
-
-        crc_result = self.crc16_modbus(bytes_hex) # Retorna o CRC16
-
-        parte_superior = (crc_result >> 8) & 0xFF  # Desloca 8 bits para a direita e aplica a máscara 0xFF
-        parte_inferior = crc_result & 0xFF        # Aplica a máscara 0xFF diretamente
+        bytes_hex = bytes.fromhex(hex_text)
+        crc_result = self.crc16_modbus(bytes_hex)
+        parte_superior = (crc_result >> 8) & 0xFF
+        parte_inferior = crc_result & 0xFF
 
         for i in range(3):
             try:
-                # Repete-se os comandos em decimal com os devidos bytes de CRC
-                self.ser.write([broadcast,3,0,2,0,1,parte_inferior,parte_superior])
-                # self.ser.flush()
-                # start_time = time.time()
-
-                while not self.ser.readable():
-                    # if time.time() - start_time > self.ser.timeout:
-                    #     print("Timeout: Nenhuma resposta do escravo.")
-                    #     break
-                    time.sleep(0.1)  # Aguarde um curto período antes de verificar novamente
-
-                dados_recebidos = self.ser.read(7)
-                self.ser.flushInput()  # Limpa o buffer de entrada após a leitura
-                if dados_recebidos != b'':
-                    dados_recebidos = dados_recebidos.hex()
-                    hex_text = dados_recebidos[0:2]+dados_recebidos[2:4]+dados_recebidos[4:6]+dados_recebidos[6:8]+dados_recebidos[8:10]
-                    bytes_hex = bytes.fromhex(hex_text) # Transforma em hexa
-                    crc_result = self.crc16_modbus(bytes_hex) # Retorna o CRC
-
-                    parte_superior = (crc_result >> 8) & 0xFF  # Desloca 8 bits para a direita e aplica a máscara 0xFF
-                    parte_inferior = crc_result & 0xFF        # Aplica a máscara 0xFF diretamente
-
-                    superior_crc = int(dados_recebidos[12:14],16) # Transforma de hexa para int
-                    inferior_crc = int(dados_recebidos[10:12],16) # Transforma de hexa para int
-
-                    if parte_superior == superior_crc and parte_inferior == inferior_crc:
-                        dados_recebidos = dados_recebidos[6:10]
-                        dados_recebidos = int(dados_recebidos,16)
-                        return dados_recebidos
+                tx = [broadcast, 3, 0, 2, 0, 1, parte_inferior, parte_superior]
+                resp = self._write_and_read(tx, expected_len=7, timeout=1.0)
+                if resp:
+                    hex_recv = resp.hex()
+                    # valida CRC
+                    # reconstrói bytes para calculo CRC (menor parte)
+                    bytes_for_crc = bytes.fromhex(hex_recv[0:10])
+                    crc_calc = self.crc16_modbus(bytes_for_crc)
+                    sup = (crc_calc >> 8) & 0xFF
+                    inf = crc_calc & 0xFF
+                    superior_crc = int(hex_recv[12:14], 16)
+                    inferior_crc = int(hex_recv[10:12], 16)
+                    if sup == superior_crc and inf == inferior_crc:
+                        dados_recebidos = hex_recv[6:10]
+                        return int(dados_recebidos, 16)
                     else:
                         if i > 1:
                             self.reset_serial()
@@ -227,30 +175,21 @@ class IO_MODBUS:
                     if i > 1:
                         self.reset_serial()
             except Exception as e:
-                print(f"Erro de comunicação: {e}")
-                return -1 # Indica erro de alguma natureza....
+                print("Erro de comunicação:", e)
+                return -1
         return -1
 
     def config_adr_PTA(self, adr):
-
-        adr_target = hex(adr)[2:]
-        adr_target = adr_target.zfill(4).upper()
-
+        adr_target = hex(adr)[2:].zfill(4).upper()
         adr_device = self._get_adr_PTA()
-
         if adr_device == -1:
             return False
-
-        id_device = hex(adr_device)[2:]
-        id_device = id_device.zfill(2).upper()
-
+        id_device = hex(adr_device)[2:].zfill(2).upper()
         hex_text = f"{id_device}060002{adr_target}"
-        bytes_hex = bytes.fromhex(hex_text)  # Transforma em hexa
-
-        crc_result = self.crc16_modbus(bytes_hex) # Retorna o CRC16
-
-        parte_superior = (crc_result >> 8) & 0xFF  # Desloca 8 bits para a direita e aplica a máscara 0xFF
-        parte_inferior = crc_result & 0xFF        # Aplica a máscara 0xFF diretamente
+        bytes_hex = bytes.fromhex(hex_text)
+        crc_result = self.crc16_modbus(bytes_hex)
+        parte_superior = (crc_result >> 8) & 0xFF
+        parte_inferior = crc_result & 0xFF
 
         adr_target_int = int(adr_target, 16)
         msb = (adr_target_int >> 8) & 0xFF
@@ -258,34 +197,19 @@ class IO_MODBUS:
 
         for i in range(3):
             try:
-                # Repete-se os comandos em decimal com os devidos bytes de CRC
-                self.ser.write([adr_device,6,0,2,msb,lsb,parte_inferior,parte_superior])
-                # self.ser.flush()
-                # start_time = time.time()
-
-                while not self.ser.readable():
-                    # if time.time() - start_time > self.ser.timeout:
-                    #     print("Timeout: Nenhuma resposta do escravo.")
-                    #     break
-                    time.sleep(0.1)  # Aguarde um curto período antes de verificar novamente
-
-                dados_recebidos = self.ser.read(8)
-                self.ser.flushInput()  # Limpa o buffer de entrada após a leitura
-                if dados_recebidos != b'':
-                    dados_recebidos = dados_recebidos.hex()
-                    hex_text = dados_recebidos[0:2]+dados_recebidos[2:4]+dados_recebidos[4:6]+dados_recebidos[6:8]+dados_recebidos[8:10]+dados_recebidos[10:12]
-                    bytes_hex = bytes.fromhex(hex_text) # Transforma em hexa
-                    crc_result = self.crc16_modbus(bytes_hex) # Retorna o CRC
-
-                    parte_superior = (crc_result >> 8) & 0xFF  # Desloca 8 bits para a direita e aplica a máscara 0xFF
-                    parte_inferior = crc_result & 0xFF        # Aplica a máscara 0xFF diretamente
-
-                    superior_crc = int(dados_recebidos[14:16],16) # Transforma de hexa para int
-                    inferior_crc = int(dados_recebidos[12:14],16) # Transforma de hexa para int
-
-                    if parte_superior == superior_crc and parte_inferior == inferior_crc:
-                        id_target = int(dados_recebidos[0:2], 16)
-                        id_change = int(dados_recebidos[8:12],16)
+                tx = [adr_device, 6, 0, 2, msb, lsb, parte_inferior, parte_superior]
+                resp = self._write_and_read(tx, expected_len=8, timeout=1.0)
+                if resp:
+                    hex_recv = resp.hex()
+                    bytes_for_crc = bytes.fromhex(hex_recv[0:12])
+                    crc_calc = self.crc16_modbus(bytes_for_crc)
+                    sup = (crc_calc >> 8) & 0xFF
+                    inf = crc_calc & 0xFF
+                    superior_crc = int(hex_recv[14:16], 16)
+                    inferior_crc = int(hex_recv[12:14], 16)
+                    if sup == superior_crc and inf == inferior_crc:
+                        id_target = int(hex_recv[0:2], 16)
+                        id_change = int(hex_recv[8:12], 16)
                         return id_target, id_change
                     else:
                         if i > 1:
@@ -294,60 +218,32 @@ class IO_MODBUS:
                     if i > 1:
                         self.reset_serial()
             except Exception as e:
-                print(f"Erro de comunicação: {e}")
-                return -1 # Indica erro de alguma natureza....
+                print("Erro de comunicação:", e)
+                return -1
         return -1
-        
-    # def wp_8026(self, adr, input):
-    #     if self.fake_modbus == False:
-    #         pass
-    #         # return self.wp_8026_(adr=adr, input=input)
-    #     else:
-    #         # return random.randint(0,1)
-    #         return self.dado.passa_condutividade  if input == 8 else self.dado.passa_isolacao
-        
+
     def get_temperature_channel(self, adr):
-
-        id_device = hex(adr)[2:]
-        id_device = id_device.zfill(2).upper()
-
-        hex_text = f"{id_device}0300000001"
-        bytes_hex = bytes.fromhex(hex_text)  # Transforma em hexa
-
-        crc_result = self.crc16_modbus(bytes_hex) # Retorna o CRC16
-
-        parte_superior = (crc_result >> 8) & 0xFF  # Desloca 8 bits para a direita e aplica a máscara 0xFF
-        parte_inferior = crc_result & 0xFF        # Aplica a máscara 0xFF diretamente
+        hex_id = hex(adr)[2:].zfill(2).upper()
+        hex_text = f"{hex_id}0300000001"
+        bytes_hex = bytes.fromhex(hex_text)
+        crc_result = self.crc16_modbus(bytes_hex)
+        parte_superior = (crc_result >> 8) & 0xFF
+        parte_inferior = crc_result & 0xFF
 
         for i in range(3):
             try:
-                # Repete-se os comandos em decimal com os devidos bytes de CRC
-                self.ser.write([adr,3,0,0,0,1,parte_inferior,parte_superior])
-                # self.ser.flush()
-                # start_time = time.time()
-
-                while not self.ser.readable():
-                    # if time.time() - start_time > self.ser.timeout:
-                    #     print("Timeout: Nenhuma resposta do escravo.")
-                    #     break
-                    time.sleep(0.1)  # Aguarde um curto período antes de verificar novamente
-
-                dados_recebidos = self.ser.read(7)
-                self.ser.flushInput()  # Limpa o buffer de entrada após a leitura
-                if dados_recebidos != b'':
-                    dados_recebidos = dados_recebidos.hex()
-                    hex_text = dados_recebidos[0:2]+dados_recebidos[2:4]+dados_recebidos[4:6]+dados_recebidos[6:8]+dados_recebidos[8:10]
-                    bytes_hex = bytes.fromhex(hex_text) # Transforma em hexa
-                    crc_result = self.crc16_modbus(bytes_hex) # Retorna o CRC
-
-                    parte_superior = (crc_result >> 8) & 0xFF  # Desloca 8 bits para a direita e aplica a máscara 0xFF
-                    parte_inferior = crc_result & 0xFF        # Aplica a máscara 0xFF diretamente
-
-                    superior_crc = int(dados_recebidos[12:14],16) # Transforma de hexa para int
-                    inferior_crc = int(dados_recebidos[10:12],16) # Transforma de hexa para int
-
-                    if parte_superior == superior_crc and parte_inferior == inferior_crc:
-                        value = int(dados_recebidos[6:10], 16)/10
+                tx = [adr, 3, 0, 0, 0, 1, parte_inferior, parte_superior]
+                resp = self._write_and_read(tx, expected_len=7, timeout=1.0)
+                if resp:
+                    hex_recv = resp.hex()
+                    bytes_for_crc = bytes.fromhex(hex_recv[0:10])
+                    crc_calc = self.crc16_modbus(bytes_for_crc)
+                    sup = (crc_calc >> 8) & 0xFF
+                    inf = crc_calc & 0xFF
+                    superior_crc = int(hex_recv[12:14], 16)
+                    inferior_crc = int(hex_recv[10:12], 16)
+                    if sup == superior_crc and inf == inferior_crc:
+                        value = int(hex_recv[6:10], 16) / 10.0
                         return value
                     else:
                         if i > 1:
@@ -356,22 +252,22 @@ class IO_MODBUS:
                     if i > 1:
                         self.reset_serial()
             except Exception as e:
-                print(f"Erro de comunicação: {e}")
-                return -1 # Indica erro de alguma natureza....
+                print("Erro de comunicação:", e)
+                return -1
         return -1
 
-    
     def reset_serial(self):
         try:
-            self.ser.close()
-            time.sleep(0.5)  # Aguarda um curto período antes de reabrir a porta
-            self.ser.open()
-            self.ser.flushInput()  # Limpa o buffer de entrada após reabrir a porta
-            print("Porta serial resetada com sucesso.")
+            if self.uart:
+                self.uart.deinit()
+                time.sleep(0.5)
+                self.uart = machine.UART(0, baudrate=9600, bits=8, parity=None, stop=1)
+                print("UART0 resetada com sucesso.")
         except Exception as e:
-            print(f"Erro ao resetar a porta serial: {e}")
+            print("Erro ao resetar UART0:", e)
 
 if __name__ == '__main__':
+    # testes simples podem ser feitos interativamente no REPL do Pico
     import time
     io = IO_MODBUS()
     io.config_adr_PTA(3)
