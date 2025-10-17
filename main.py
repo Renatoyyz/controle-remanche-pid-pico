@@ -80,7 +80,15 @@ if __name__ == "__main__":
     try:
         pot.counter = 1
         pot.val_max = 2
+
+        # previous switch state for edge-detection (debounce simple)
+        prev_sw = pot.get_sw_status
+
         while True:
+            # read current switch state and detect press edge
+            cur_sw = pot.get_sw_status
+            press = (cur_sw == 0 and prev_sw != 0)
+
             if dado.telas == dado.TELA_INICIAL:
                 lcd.lcd_display_string("**** QUALIFIX **** ", 1, 1)
                 lcd.lcd_display_string("Iniciar", 2, 1)
@@ -99,12 +107,13 @@ if __name__ == "__main__":
                     except Exception:
                         remote_start = False
 
-                if pot.get_sw_status == 0 and (pot.counter == 1 or remote_start):
+                # use press-edge to avoid bouncing / rapid re-trigger
+                if press and (pot.counter == 1 or remote_start):
                     dado.set_telas(dado.TELA_EXECUCAO)
                     pid.set_control_flag(True)
                     lcd.lcd_clear()
                     time.sleep(0.3)
-                elif pot.get_sw_status == 0 and pot.counter == 2:
+                elif press and pot.counter == 2:
                     pot.counter = 1
                     dado.set_telas(dado.TELA_CONFIGURACAO)
                     lcd.lcd_clear()
@@ -123,7 +132,8 @@ if __name__ == "__main__":
                     except Exception:
                         remote_stop = False
 
-                if pot.get_sw_status == 0 or remote_stop:
+                # stop on press-edge or remote stop signal
+                if press or remote_stop:
                     if io.io_rpi is not None:
                         try:
                             io.io_rpi.aciona_maquina_pronta(False)
@@ -144,7 +154,7 @@ if __name__ == "__main__":
                     lcd.lcd_display_string(">", 2, 0)
                     lcd.lcd_display_string(" ", 3, 0)
                     lcd.lcd_display_string(" ", 4, 0)
-                    if pot.get_sw_status == 0:
+                    if press:
                         dado.set_telas(TELA_CONFIGURACAO_TEMP)
                         lcd.lcd_clear()
                         time.sleep(0.3)
@@ -152,7 +162,7 @@ if __name__ == "__main__":
                     lcd.lcd_display_string(" ", 2, 0)
                     lcd.lcd_display_string(">", 3, 0)
                     lcd.lcd_display_string(" ", 4, 0)
-                    if pot.get_sw_status == 0:
+                    if press:
                         dado.set_telas(TELA_CONFIGURACAO_PID)
                         lcd.lcd_clear()
                         time.sleep(0.3)
@@ -160,7 +170,7 @@ if __name__ == "__main__":
                     lcd.lcd_display_string(" ", 2, 0)
                     lcd.lcd_display_string(" ", 3, 0)
                     lcd.lcd_display_string(">", 4, 0)
-                    if pot.get_sw_status == 0:
+                    if press:
                         dado.set_telas(dado.TELA_INICIAL)
                         lcd.lcd_clear()
                         time.sleep(0.3)
@@ -171,6 +181,7 @@ if __name__ == "__main__":
                 lcd.lcd_display_string(f"Canal {canal}", 1, 1)
                 lcd.lcd_display_string(f"Temp: {setpoint_list[canal-1]}C", 2, 1)
                 lcd.lcd_display_string("Sair: ", 3, 1)
+                # inside config editing we keep using the original behavior (blocking adjustment)
                 if pot.get_sw_status == 0:
                     time.sleep(0.6)
                     ajt = 1
@@ -236,6 +247,9 @@ if __name__ == "__main__":
                                             lcd.lcd_clear()
                                             time.sleep(0.3)
 
+            # update previous switch state for edge detection
+            prev_sw = cur_sw
+
             # small yield to avoid CPU hog
             time.sleep(0.05)
 
@@ -252,3 +266,5 @@ if __name__ == "__main__":
             pass
         pid.set_control_flag(False)
         pid.stop()
+        print("Saindo do programa")
+        raise
